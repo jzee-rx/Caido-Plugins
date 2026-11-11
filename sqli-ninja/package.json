@@ -1,0 +1,19 @@
+{
+  "name": "sqli-ninja",
+  "version": "1.0.0",
+  "description": "Advanced SQL Injection testing plugin for Caido",
+  "main": "dist/backend.js",
+  "scripts": {
+    "build": "caido-dev build",
+    "dev": "caido-dev dev"
+  },
+  "devDependencies": {
+    "@caido-community/dev": "^0.1.7",
+    "@caido/sdk-backend": "^0.59.0",
+    "@caido/sdk-frontend": "^0.59.0",
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.0.0",
+    "vue": "^3.4.0"
+  }
+}

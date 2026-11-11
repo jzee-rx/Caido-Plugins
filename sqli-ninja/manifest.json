@@ -1,0 +1,28 @@
+{
+  "id": "sqli-ninja",
+  "name": "SQLi Ninja",
+  "version": "1.0.0",
+  "description": "Advanced SQL Injection testing plugin with detection, exploitation, and data extraction",
+  "author": {
+    "name": "jzrx",
+    "email": "jzrx@local"
+  },
+  "plugins": [
+    {
+      "id": "sqli-ninja-backend",
+      "kind": "backend",
+      "name": "SQLi Ninja Backend",
+      "runtime": "javascript",
+      "entrypoint": "dist/backend/index.js"
+    },
+    {
+      "id": "sqli-ninja-frontend",
+      "kind": "frontend",
+      "name": "SQLi Ninja Frontend",
+      "entrypoint": "dist/frontend/index.js",
+      "backend": {
+        "id": "sqli-ninja-backend"
+      }
+    }
+  ]
+}
