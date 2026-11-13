@@ -3796,6 +3796,28 @@ function confirmErrorBased(baselineBody, injectedBody, titleDbms) {
   }
   return null;
 }
+function stripEchoes(body, ...injected) {
+  let out = body;
+  for (const inj of injected) {
+    if (!inj || inj.length < 3) continue;
+    const variants = /* @__PURE__ */ new Set([
+      inj,
+      encodeURIComponent(inj),
+      inj.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")
+    ]);
+    for (const vv of variants) if (vv) out = out.split(vv).join("");
+  }
+  return out;
+}
+function markerValue(body, injectedPayload) {
+  const m = body.match(/~([^~]*)~/);
+  if (!m || m[1] === "") return null;
+  const val = m[1];
+  if (val.length >= 4 && injectedPayload.includes(val)) return null;
+  if (/CAST\s*\(|CONCAT\s*\(|0x7e|@@|STRING_AGG|SUBSTR(ING)?\s*\(|NVARCHAR\s*\(/i.test(val)) return null;
+  if (val.includes(GH_ERROR_MARKER)) return null;
+  return val;
+}
 function normalizeBody(s) {
   return s.replace(/[A-Za-z0-9+/=_-]{24,}/g, "T").replace(/\d+/g, "#");
 }
@@ -4224,10 +4246,10 @@ async function extractReflected(v, sqlExpr, sid = "") {
         const payload2 = `${v.prefix}AND ${errorMarkerPayload("mysql", inner)}${v.suffix}`;
         const r2 = await sendVectorPayload(v, payload2, sid);
         if (!r2) break;
-        const m = r2.body.match(/~([^~]*)~/);
-        if (!m || m[1] === "") break;
-        result += m[1];
-        if (m[1].length < chunk) break;
+        const val = markerValue(r2.body, payload2);
+        if (val === null) break;
+        result += val;
+        if (val.length < chunk) break;
         offset += chunk;
       }
       return result.length > 0 ? result : null;
@@ -4235,8 +4257,8 @@ async function extractReflected(v, sqlExpr, sid = "") {
     const payload = `${v.prefix}AND ${errorMarkerPayload(v.dbms, sqlExpr)}${v.suffix}`;
     const r = await sendVectorPayload(v, payload, sid);
     if (r) {
-      const m = r.body.match(/~([^~]*)~/);
-      if (m && m[1] !== "") return m[1];
+      const val = markerValue(r.body, payload);
+      if (val !== null) return val;
     }
     return null;
   }
@@ -4245,8 +4267,8 @@ async function extractReflected(v, sqlExpr, sid = "") {
     const payload = `${v.prefix}UNION ALL SELECT ${concat}${v.suffix}`;
     const r = await sendVectorPayload(v, payload, sid);
     if (r) {
-      const m = r.body.match(/~([^~]*)~/);
-      if (m && m[1] !== "") return m[1];
+      const val = markerValue(r.body, payload);
+      if (val !== null) return val;
     }
     return null;
   }
@@ -4627,6 +4649,15 @@ function init(sdkInstance) {
           }
         }
       }
+      let paramReflects = false;
+      {
+        const canary = `qZx${generateRandom()}${generateRandom()}Xzq`;
+        const rp = await sendRequest(requestId, param.name, param.type, param.value + canary, rawRequest, sessionId);
+        if (rp && rp.body.includes(canary)) {
+          paramReflects = true;
+          sendLog2(`[i] Param "${param.name}" is reflected in the response \u2014 reflection guard ON (echoed markers won't count as SQLi).`, "warn");
+        }
+      }
       let confirmedDbms = heuristicDbms;
       if (techniques.includes("error")) {
         sendLog2(``, "info");
@@ -4641,8 +4672,9 @@ function init(sdkInstance) {
               if (verbose) sendLog2(`    [PAYLOAD] ${fullPayload.substring(0, 100)}${fullPayload.length > 100 ? "..." : ""}`, "verbose");
               const resp = await sendRequest(requestId, param.name, param.type, fullPayload, rawRequest, sessionId);
               if (!resp) continue;
-              const markerHit = resp.body.includes(GH_ERROR_MARKER) && !baselineResp.body.includes(GH_ERROR_MARKER);
-              const errConfirm = confirmErrorBased(baselineResp.body, resp.body, ghGroupToCode(entry.dbms));
+              const injectedEcho = stripEchoes(resp.body, fullPayload, probe);
+              const markerHit = !paramReflects && injectedEcho.includes(GH_ERROR_MARKER) && !baselineResp.body.includes(GH_ERROR_MARKER);
+              const errConfirm = confirmErrorBased(baselineResp.body, injectedEcho, ghGroupToCode(entry.dbms));
               if (markerHit || errConfirm) {
                 const detectedDbms = errConfirm && errConfirm.dbms !== "unknown" ? errConfirm.dbms : ghGroupToCode(entry.dbms) !== "unknown" ? ghGroupToCode(entry.dbms) : confirmedDbms;
                 if (detectedDbms !== "unknown") confirmedDbms = detectedDbms;
@@ -4855,7 +4887,8 @@ Response delay: ${confirmResp.time}ms (expected ~${expectedDelay}ms)`,
               const versionPayload = unionPayload.replace("NULL", heuristicDbms === "mysql" ? "VERSION()" : heuristicDbms === "mssql" ? "@@VERSION" : heuristicDbms === "postgresql" ? "version()" : "NULL");
               const versionFullPayload = `${param.value}${pref}${versionPayload}${suf}`;
               const versionResp = await sendRequest(requestId, param.name, param.type, versionFullPayload, rawRequest, sessionId);
-              if (versionResp && versionResp.body.match(/\d+\.\d+\.\d+|MariaDB|PostgreSQL|Microsoft|Oracle/i)) {
+              const versionBody = versionResp ? stripEchoes(versionResp.body, versionFullPayload, versionPayload) : "";
+              if (versionResp && versionBody.match(/\d+\.\d+\.\d+|MariaDB|PostgreSQL|Microsoft|Oracle/i)) {
                 sendLog2(`[+] VULNERABLE! UNION-based SQLi confirmed`, "success");
                 sendLog2(`    Columns: ${nullCount}`, "success");
                 const finding = {

